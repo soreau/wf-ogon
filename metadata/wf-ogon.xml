@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<wayfire>
+	<plugin name="wf-ogon">
+		<_short>Wayfire Ogon</_short>
+		<_long>Wayfire RDP plugin using ogon.</_long>
+		<category>Utility</category>
+	</plugin>
+</wayfire>
