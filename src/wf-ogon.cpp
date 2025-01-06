@@ -54,6 +54,9 @@ extern "C"
 #include <wlr/backend/multi.h>
 }
 
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+
 namespace wf
 {
 namespace ogon
@@ -194,21 +197,9 @@ class rdp_plugin : public wf::plugin_interface_t
             OpenGL::render_begin();
             GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER, source.fb));
             GL_CALL(glReadPixels(0, 0, size.width, size.height,
-                GL_RGBA, GL_UNSIGNED_BYTE, pixels.data()));
+                GL_BGRA_EXT, GL_UNSIGNED_BYTE, pixels.data()));
             OpenGL::render_end();
-            /* Swizzle red and blue pixels */
-            void *data = malloc(pixels_size_bytes);
-            unsigned char *src = pixels.data();
-            unsigned char *dst = (unsigned char *) data;
-            for (int i = 0; i < pixels_size_bytes; i += 4)
-            {
-                dst[i + 0] = src[i + 2];
-                dst[i + 1] = src[i + 1];
-                dst[i + 2] = src[i + 0];
-                dst[i + 3] = src[i + 3];
-            }
-            memcpy(ogon_buffer, data, pixels_size_bytes);
-            free(data);
+            memcpy(ogon_buffer, pixels.data(), pixels_size_bytes);
         }
 
         ogon_msg_framebuffer_sync_reply rds_sync_reply =
