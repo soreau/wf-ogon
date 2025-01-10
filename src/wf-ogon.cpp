@@ -76,6 +76,7 @@ static const struct wlr_keyboard_impl keyboard_impl = {
 class cdata_ogon_output_post_hook : public wf::custom_data_t
 {
   public:
+    wf::signal::connection_t<wf::output_configuration_changed_signal> output_changed;
     wf::wl_listener_wrapper output_commit;
     wf::region_t last_damage, last_last_damage;
 };
@@ -166,6 +167,7 @@ class rdp_plugin : public wf::plugin_interface_t
     void add_hook(wf::output_t *output)
     {
         auto cdata = output->get_data_safe<cdata_ogon_output_post_hook>();
+
         cdata->output_commit.set_callback([=] (void *data)
         {
             RDP_RECT *rdpRect;
@@ -245,7 +247,23 @@ class rdp_plugin : public wf::plugin_interface_t
                 }
             }
         });
+
+        cdata->output_changed.set_callback([=] (wf::output_configuration_changed_signal *ev)
+        {
+            rds_fb_infos.width = rds_fb_infos.height = 0;
+            for (auto& o : wf::get_core().output_layout->get_outputs())
+            {
+                auto og = o->get_layout_geometry();
+                LOGI("output: ", og.x, ",", og.y, " ", og.width, "x", og.height);
+                rds_fb_infos.width  = std::max(og.x + og.width, int(rds_fb_infos.width));
+                rds_fb_infos.height = std::max(og.y + og.height, int(rds_fb_infos.height));
+            }
+
+            ogon_send_shared_framebuffer(this);
+        });
+
         cdata->output_commit.connect(&output->handle->events.commit);
+        output->connect(&cdata->output_changed);
         output->render->damage_whole();
     }
 
@@ -253,6 +271,7 @@ class rdp_plugin : public wf::plugin_interface_t
     {
         auto cdata = output->get_data_safe<cdata_ogon_output_post_hook>();
         cdata->output_commit.disconnect();
+        cdata->output_changed.disconnect();
     }
 
     void do_key(uint32_t key, wl_keyboard_key_state state)
