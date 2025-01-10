@@ -77,7 +77,7 @@ class cdata_ogon_output_post_hook : public wf::custom_data_t
 {
   public:
     wf::wl_listener_wrapper output_commit;
-    wf::region_t last_damage;
+    wf::region_t last_damage, last_last_damage;
 };
 
 class rdp_plugin : public wf::plugin_interface_t
@@ -199,20 +199,17 @@ class rdp_plugin : public wf::plugin_interface_t
 
             if (ogon_buffer)
             {
-                auto og = output->get_layout_geometry();
-                std::vector<unsigned char> pixels(og.width * og.height * 4);
-                OpenGL::render_begin();
-                GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER, output->render->get_target_framebuffer().fb));
-                GL_CALL(glReadPixels(0, 0, og.width, og.height,
-                    GL_BGRA_EXT, GL_UNSIGNED_BYTE, pixels.data()));
-                OpenGL::render_end();
+                auto og     = output->get_layout_geometry();
                 auto damage = wf::region_t{(pixman_region32_t*)&ev->state->damage};
-                auto combined_damage = damage | cdata->last_damage;
+                auto combined_damage = damage | cdata->last_damage | cdata->last_last_damage;
                 pixman_region32_rectangles(combined_damage.to_pixman(), &n_rects);
+                ogon_dmgbuf_set_num_rects(this->dmg_buf, n_rects);
                 if (n_rects)
                 {
-                    ogon_dmgbuf_set_num_rects(this->dmg_buf, n_rects);
                     rdpRect = ogon_dmgbuf_get_rects(this->dmg_buf, NULL);
+                    OpenGL::render_begin();
+                    GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                        wlr_gles2_renderer_get_buffer_fbo(wf::get_core().renderer, ev->state->buffer)));
                     for (auto& box : combined_damage)
                     {
                         auto b     = wlr_box_from_pixman_box(box);
@@ -220,27 +217,33 @@ class rdp_plugin : public wf::plugin_interface_t
                         rdpRect->y = og.y + b.y;
                         rdpRect->width  = b.width;
                         rdpRect->height = b.height;
+                        std::vector<unsigned char> pixels(b.width * b.height * 4);
+                        GL_CALL(glReadPixels(b.x, b.y, b.width, b.height,
+                            GL_BGRA_EXT, GL_UNSIGNED_BYTE, pixels.data()));
                         for (int y = rdpRect->y; y < rdpRect->y + rdpRect->height; y++)
                         {
                             memcpy((unsigned char*)ogon_buffer + (rdpRect->x * 4) +
                                 (y * rds_fb_infos.scanline),
-                                pixels.data() + ((y - og.y) * og.width * 4 + b.x * 4), b.width * 4);
+                                pixels.data() + ((y - (og.y + b.y)) * b.width * 4), b.width * 4);
                         }
 
                         rdpRect++;
                     }
 
-                    cdata->last_damage = wf::region_t{(pixman_region32_t*)&ev->state->damage};
+                    OpenGL::render_end();
+
+                    cdata->last_last_damage = cdata->last_damage;
+                    cdata->last_damage = damage;
+
+                    ogon_msg_framebuffer_sync_reply rds_sync_reply =
+                    {
+                        .bufferId = this->pending_shm_id,
+                    };
+
+                    ogon_service_write_message(ogon_service, OGON_SERVER_FRAMEBUFFER_SYNC_REPLY,
+                        (ogon_message*)&rds_sync_reply);
                 }
             }
-
-            ogon_msg_framebuffer_sync_reply rds_sync_reply =
-            {
-                .bufferId = this->pending_shm_id,
-            };
-
-            ogon_service_write_message(ogon_service, OGON_SERVER_FRAMEBUFFER_SYNC_REPLY,
-                (ogon_message*)&rds_sync_reply);
         });
         cdata->output_commit.connect(&output->handle->events.commit);
         output->render->damage_whole();
@@ -383,10 +386,6 @@ class rdp_plugin : public wf::plugin_interface_t
     int rdsFramebufferSyncRequest(INT32 buffer_id)
     {
         pending_shm_id = buffer_id;
-        for (auto& o : wf::get_core().output_layout->get_outputs())
-        {
-            o->render->schedule_redraw();
-        }
 
         return 1;
     }
