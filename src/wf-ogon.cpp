@@ -73,12 +73,12 @@ static const struct wlr_keyboard_impl keyboard_impl = {
     .led_update = led_update,
 };
 
-class cdata_ogon_output_post_hook : public wf::custom_data_t
+class cdata_ogon_output_commit_hook : public wf::custom_data_t
 {
   public:
     wf::signal::connection_t<wf::output_configuration_changed_signal> output_changed;
     wf::wl_listener_wrapper output_commit;
-    wf::region_t damage, last_damage, last_last_damage;
+    wf::region_t damage, last_damage;
 };
 
 class rdp_plugin : public wf::plugin_interface_t
@@ -92,7 +92,9 @@ class rdp_plugin : public wf::plugin_interface_t
     wlr_pointer pointer;
     wlr_keyboard keyboard;
     wlr_backend *backend;
-    void *dmg_buf = NULL;
+    void *dmg_buf     = NULL;
+    RDP_RECT *rdpRect = NULL;
+    int screen_n_rects  = 0;
     int pending_outputs = 0;
     int pending_shm_id  = -1;
     ogon_msg_framebuffer_info rds_fb_infos;
@@ -167,16 +169,20 @@ class rdp_plugin : public wf::plugin_interface_t
 
     void add_hook(wf::output_t *output)
     {
-        auto cdata = output->get_data_safe<cdata_ogon_output_post_hook>();
+        auto cdata = output->get_data_safe<cdata_ogon_output_commit_hook>();
 
         cdata->output_commit.set_callback([=] (void *data)
         {
-            RDP_RECT *rdpRect;
             int n_rects;
             auto ev = (wlr_output_event_commit*)data;
             if (!ev || !ev->state || !ev->state->buffer)
             {
                 return;
+            }
+
+            if (ev->state->committed & WLR_OUTPUT_STATE_DAMAGE)
+            {
+                cdata->damage |= wf::region_t{(pixman_region32_t*)&ev->state->damage};
             }
 
             if (this->dmg_buf)
@@ -200,52 +206,50 @@ class rdp_plugin : public wf::plugin_interface_t
                 ogon_buffer = ogon_dmgbuf_get_data(this->dmg_buf);
             }
 
+            if (!rdpRect)
+            {
+                rdpRect = ogon_dmgbuf_get_rects(this->dmg_buf, NULL);
+            }
+
             if (ogon_buffer)
             {
-                wf::region_t damage;
+                wf::region_t combined_damage;
                 auto og = output->get_layout_geometry();
-                if (ev->state->committed & WLR_OUTPUT_STATE_DAMAGE)
-                {
-                    damage |= wf::region_t{(pixman_region32_t*)&ev->state->damage};
-                    damage &= wf::region_t{output->get_relative_geometry()};
-                } else if (ev->state->committed & WLR_OUTPUT_STATE_BUFFER)
-                {
-                    damage = wf::region_t{output->get_relative_geometry()};
-                }
-
-                damage |= cdata->last_damage | cdata->last_last_damage;
-                pixman_region32_rectangles(damage.to_pixman(), &n_rects);
+                combined_damage = (cdata->damage | cdata->last_damage) & wf::region_t{output->get_relative_geometry()};
+                pixman_region32_rectangles(combined_damage.to_pixman(), &n_rects);
                 if (n_rects)
                 {
-                    rdpRect = ogon_dmgbuf_get_rects(this->dmg_buf, NULL);
                     if (n_rects > (int)ogon_dmgbuf_get_max_rects(this->dmg_buf))
                     {
-                        ogon_dmgbuf_set_num_rects(this->dmg_buf, 1);
+                        n_rects = 1;
+                        auto extents = combined_damage.get_extents();
+                        wlr_box b    = wlr_box{extents.x1, extents.y1, extents.x2 - extents.x1, extents.y2 - extents.y1};
                         OpenGL::render_begin();
                         GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER,
                             wlr_gles2_renderer_get_buffer_fbo(wf::get_core().renderer, ev->state->buffer)));
-                        rdpRect->x     = og.x;
-                        rdpRect->y     = og.y;
-                        rdpRect->width = og.width;
-                        rdpRect->height = og.height;
-                        std::vector<unsigned char> pixels(og.width * og.height * 4);
-                        GL_CALL(glReadPixels(0, 0, og.width, og.height,
+                        rdpRect->x     = og.x + b.x;
+                        rdpRect->y     = og.y + b.y;
+                        rdpRect->width = b.width;
+                        rdpRect->height = b.height;
+                        std::vector<unsigned char> pixels(b.width * b.height * 4);
+                        GL_CALL(glReadPixels(b.x, b.y, b.width, b.height,
                             GL_BGRA_EXT, GL_UNSIGNED_BYTE, pixels.data()));
                         for (int y = rdpRect->y; y < rdpRect->y + rdpRect->height; y++)
                         {
                             memcpy((unsigned char*)ogon_buffer + (rdpRect->x * 4) +
                                 (y * rds_fb_infos.scanline),
-                                pixels.data() + ((y - og.y) * og.width * 4), og.width * 4);
+                                pixels.data() + ((y - (og.y + b.y)) * b.width * 4), b.width * 4);
                         }
+
+                        rdpRect++;
 
                         OpenGL::render_end();
                     } else
                     {
-                        ogon_dmgbuf_set_num_rects(this->dmg_buf, n_rects);
                         OpenGL::render_begin();
                         GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER,
                             wlr_gles2_renderer_get_buffer_fbo(wf::get_core().renderer, ev->state->buffer)));
-                        for (auto& box : damage)
+                        for (auto& box : combined_damage)
                         {
                             auto b     = wlr_box_from_pixman_box(box);
                             rdpRect->x = og.x + b.x;
@@ -267,25 +271,39 @@ class rdp_plugin : public wf::plugin_interface_t
 
                         OpenGL::render_end();
                     }
-
-                    cdata->last_last_damage = cdata->last_damage;
-                    cdata->last_damage = damage;
                 }
+
+                cdata->last_damage = cdata->damage;
+
+                screen_n_rects += n_rects;
 
                 if (pending_outputs)
                 {
                     pending_outputs--;
+
+                    if (!pending_outputs)
+                    {
+                        ogon_dmgbuf_set_num_rects(this->dmg_buf, screen_n_rects);
+
+                        ogon_msg_framebuffer_sync_reply rds_sync_reply =
+                        {
+                            .bufferId = this->pending_shm_id,
+                        };
+                        ogon_service_write_message(ogon_service, OGON_SERVER_FRAMEBUFFER_SYNC_REPLY,
+                            (ogon_message*)&rds_sync_reply);
+
+                        for (auto& o : wf::get_core().output_layout->get_outputs())
+                        {
+                            auto custom_data = o->get_data_safe<cdata_ogon_output_commit_hook>();
+                            custom_data->damage.clear();
+                        }
+                    }
                 }
 
                 if (!pending_outputs)
                 {
-                    ogon_msg_framebuffer_sync_reply rds_sync_reply =
-                    {
-                        .bufferId = this->pending_shm_id,
-                    };
-
-                    ogon_service_write_message(ogon_service, OGON_SERVER_FRAMEBUFFER_SYNC_REPLY,
-                        (ogon_message*)&rds_sync_reply);
+                    screen_n_rects = 0;
+                    rdpRect = NULL;
                 }
             }
         });
@@ -311,7 +329,7 @@ class rdp_plugin : public wf::plugin_interface_t
 
     void rem_hook(wf::output_t *output)
     {
-        auto cdata = output->get_data_safe<cdata_ogon_output_post_hook>();
+        auto cdata = output->get_data_safe<cdata_ogon_output_commit_hook>();
         cdata->output_commit.disconnect();
         cdata->output_changed.disconnect();
     }
@@ -446,7 +464,14 @@ class rdp_plugin : public wf::plugin_interface_t
 
     int rdsFramebufferSyncRequest(INT32 buffer_id)
     {
-        pending_shm_id = buffer_id;
+        pending_shm_id  = buffer_id;
+        pending_outputs = wf::get_core().output_layout->get_outputs().size();
+        for (auto& o : wf::get_core().output_layout->get_outputs())
+        {
+            auto cdata = o->get_data_safe<cdata_ogon_output_commit_hook>();
+            cdata->damage.clear();
+            o->render->schedule_redraw();
+        }
 
         return 1;
     }
@@ -458,7 +483,14 @@ class rdp_plugin : public wf::plugin_interface_t
 
     int rdsImmediateSyncRequest(INT32 buffer_id)
     {
-        pending_shm_id = buffer_id;
+        pending_shm_id  = buffer_id;
+        pending_outputs = wf::get_core().output_layout->get_outputs().size();
+        for (auto& o : wf::get_core().output_layout->get_outputs())
+        {
+            auto cdata = o->get_data_safe<cdata_ogon_output_commit_hook>();
+            cdata->damage.clear();
+            o->render->schedule_redraw();
+        }
 
         return 1;
     }
