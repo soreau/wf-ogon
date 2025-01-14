@@ -73,11 +73,14 @@ static const struct wlr_keyboard_impl keyboard_impl = {
     .led_update = led_update,
 };
 
-class cdata_ogon_output_commit_hook : public wf::custom_data_t
+class ogon_output_cdata : public wf::custom_data_t
 {
   public:
+    /* For handling output layout and mode changes */
     wf::signal::connection_t<wf::output_configuration_changed_signal> output_changed;
+    /* For handling output commits */
     wf::wl_listener_wrapper output_commit;
+    /* For handling batched regions and last output buffer damage regions */
     wf::region_t damage, last_damage;
 };
 
@@ -167,10 +170,15 @@ class rdp_plugin : public wf::plugin_interface_t
         }
     }
 
+    /* Add commit event and output_changed handlers and damage each output */
     void add_hook(wf::output_t *output)
     {
-        auto cdata = output->get_data_safe<cdata_ogon_output_commit_hook>();
+        /* Get our custom data object that is associated with the output */
+        auto cdata = output->get_data_safe<ogon_output_cdata>();
 
+        /* Callback for output commit handler. This happens after each
+         * output frame has been rendered.
+         */
         cdata->output_commit.set_callback([=] (void *data)
         {
             int n_rects;
@@ -180,11 +188,24 @@ class rdp_plugin : public wf::plugin_interface_t
                 return;
             }
 
+            /* If the compositor submitted damage, batch it by unioning
+             * it with the rest of the unprocessed damage. We must wait
+             * for ogon to submit a sync request and then copy the batched
+             * damage and the last damage to the ogon output buffer. The
+             * reason for the need to copy last damage region additionally,
+             * is that the ogon output buffer contains old data from the
+             * last frame, and these regions must be updated as well to
+             * avoid artifacts.
+             */
             if (ev->state->committed & WLR_OUTPUT_STATE_DAMAGE)
             {
                 cdata->damage |= wf::region_t{(pixman_region32_t*)&ev->state->damage};
             }
 
+            /* If we already have the ogon damage buffer, ensure it matches
+             * the shm id sent in the ogon frame sync request. If it's not,
+             * drop the buffer to be reacquired.
+             */
             if (this->dmg_buf)
             {
                 if (ogon_dmgbuf_get_id(this->dmg_buf) != this->pending_shm_id)
@@ -194,6 +215,11 @@ class rdp_plugin : public wf::plugin_interface_t
                 }
             }
 
+            /* If we do not have an ogon damage buffer at this point, try
+             * to acquire it using the shm id sent from the ogon frame sync
+             * request. Finally, get the pointer to the ogon buffer pixels
+             * from the damage buffer.
+             */
             if (!this->dmg_buf)
             {
                 this->dmg_buf = ogon_dmgbuf_connect(this->pending_shm_id);
@@ -206,24 +232,56 @@ class rdp_plugin : public wf::plugin_interface_t
                 ogon_buffer = ogon_dmgbuf_get_data(this->dmg_buf);
             }
 
+            /* Get the rects pointer, so we can define each rect we're
+             * copying into the buffer. This is only reset after all
+             * outputs have been committed.
+             */
             if (!rdpRect)
             {
                 rdpRect = ogon_dmgbuf_get_rects(this->dmg_buf, NULL);
             }
 
+            /* If we have acquired the ogon buffer and ogon has issued a
+             * frame sync request, begin processing the output's damaged
+             * regions.
+             */
             if (ogon_buffer && pending_outputs)
             {
+                /* We don't want to overwrite cdata->damage, so store the damage
+                 * in a temporary region object. */
                 wf::region_t combined_damage;
+                /* The layout geometry is the same as relative geometry with the
+                 * exception that the x,y position are both set to 0  with
+                 * relative, while the position is that of the output layout
+                 * with layout geometry.
+                 */
                 auto og = output->get_layout_geometry();
+                /* The combined damage is set to the region of current damage,
+                 * which has been batched since the last ogon frame sync request
+                 * and the last damage region, so that the pixels needed in the
+                 * ogon buffer get transfered. This is intersected with the output
+                 * geometry so we don't have any out-of-bounds rects.
+                 */
                 combined_damage = (cdata->damage | cdata->last_damage) & wf::region_t{output->get_relative_geometry()};
+                /* Get the number of rects in the combined damage region */
                 pixman_region32_rectangles(combined_damage.to_pixman(), &n_rects);
                 if (n_rects)
                 {
+                    /* If there are too many rects, just use the extents of the region. */
                     if (n_rects > (int)ogon_dmgbuf_get_max_rects(this->dmg_buf))
                     {
+                        /* Since we are using this variable to accumulate the number of
+                         * rects that will be used to update the ogon screen buffer,
+                         * set it accordingly.
+                         */
                         n_rects = 1;
+                        /* Get the extents */
                         auto extents = combined_damage.get_extents();
-                        wlr_box b    = wlr_box{extents.x1, extents.y1, extents.x2 - extents.x1, extents.y2 - extents.y1};
+                        /* Make a box from the extent values */
+                        wlr_box b = wlr_box{extents.x1, extents.y1, extents.x2 - extents.x1, extents.y2 - extents.y1};
+                        /* Read the pixels from the relevant area and copy them into the
+                         * ogon output buffer.
+                         */
                         OpenGL::render_begin();
                         GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER,
                             wlr_gles2_renderer_get_buffer_fbo(wf::get_core().renderer, ev->state->buffer)));
@@ -232,8 +290,10 @@ class rdp_plugin : public wf::plugin_interface_t
                         rdpRect->width = b.width;
                         rdpRect->height = b.height;
                         std::vector<unsigned char> pixels(b.width * b.height * 4);
+                        /* Read the pixels from the wayfire framebuffer */
                         GL_CALL(glReadPixels(b.x, b.y, b.width, b.height,
                             GL_BGRA_EXT, GL_UNSIGNED_BYTE, pixels.data()));
+                        /* Copy them one horizontal line at a time */
                         for (int y = rdpRect->y; y < rdpRect->y + rdpRect->height; y++)
                         {
                             memcpy((unsigned char*)ogon_buffer + (rdpRect->x * 4) +
@@ -241,11 +301,13 @@ class rdp_plugin : public wf::plugin_interface_t
                                 pixels.data() + ((y - (og.y + b.y)) * b.width * 4), b.width * 4);
                         }
 
+                        /* Iterate the rect pointer in case there are other outputs. */
                         rdpRect++;
 
                         OpenGL::render_end();
                     } else
                     {
+                        /* In this case, we copy all the rects in the damage region. */
                         OpenGL::render_begin();
                         GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER,
                             wlr_gles2_renderer_get_buffer_fbo(wf::get_core().renderer, ev->state->buffer)));
@@ -257,8 +319,10 @@ class rdp_plugin : public wf::plugin_interface_t
                             rdpRect->width  = b.width;
                             rdpRect->height = b.height;
                             std::vector<unsigned char> pixels(b.width * b.height * 4);
+                            /* Read the pixels from the wayfire framebuffer */
                             GL_CALL(glReadPixels(b.x, b.y, b.width, b.height,
                                 GL_BGRA_EXT, GL_UNSIGNED_BYTE, pixels.data()));
+                            /* Copy them one horizontal line at a time */
                             for (int y = rdpRect->y; y < rdpRect->y + rdpRect->height; y++)
                             {
                                 memcpy((unsigned char*)ogon_buffer + (rdpRect->x * 4) +
@@ -266,17 +330,29 @@ class rdp_plugin : public wf::plugin_interface_t
                                     pixels.data() + ((y - (og.y + b.y)) * b.width * 4), b.width * 4);
                             }
 
+                            /* Iterate the rect pointer for each rect in the damage region.
+                             * We want to iterate even after the last rect in case there are
+                             * other outputs to be processed. */
                             rdpRect++;
                         }
 
                         OpenGL::render_end();
                     }
 
+                    /* Keep track of how many rects we have copied */
                     screen_n_rects += n_rects;
                 }
 
+                /* The ogon frame sync request sets pending_outputs to the number of
+                 * wayfire outputs. This commit function is called once per output,
+                 * so decrement the variable so we know when the last output has been
+                 * processed.
+                 */
                 pending_outputs--;
 
+                /* Once all of the output pixels have been copied into the ogon screen buffer,
+                 * set the total number of rects and send the sync reply message.
+                 */
                 if (!pending_outputs)
                 {
                     ogon_dmgbuf_set_num_rects(this->dmg_buf, screen_n_rects);
@@ -288,17 +364,20 @@ class rdp_plugin : public wf::plugin_interface_t
                     ogon_service_write_message(ogon_service, OGON_SERVER_FRAMEBUFFER_SYNC_REPLY,
                         (ogon_message*)&rds_sync_reply);
 
+                    /* Reset the damage since we have processed it for all outputs. */
                     for (auto& o : wf::get_core().output_layout->get_outputs())
                     {
-                        auto custom_data = o->get_data_safe<cdata_ogon_output_commit_hook>();
+                        auto custom_data = o->get_data_safe<ogon_output_cdata>();
                         custom_data->damage.clear();
                     }
 
+                    /* Reset the total number of screen rects and the ogon rect pointer. */
                     screen_n_rects = 0;
                     rdpRect = NULL;
                 }
             }
 
+            /* Finally, store the current batched damage unconditonally. */
             cdata->last_damage = cdata->damage;
         });
 
@@ -323,7 +402,7 @@ class rdp_plugin : public wf::plugin_interface_t
 
     void rem_hook(wf::output_t *output)
     {
-        auto cdata = output->get_data_safe<cdata_ogon_output_commit_hook>();
+        auto cdata = output->get_data_safe<ogon_output_cdata>();
         cdata->output_commit.disconnect();
         cdata->output_changed.disconnect();
     }
@@ -456,13 +535,21 @@ class rdp_plugin : public wf::plugin_interface_t
         return 1;
     }
 
-    int rdsFramebufferSyncRequest(INT32 buffer_id)
+    int handle_framebuffer_sync_request(INT32 buffer_id)
     {
-        pending_shm_id  = buffer_id;
+        /* A framebuffer sync request was issued by the ogon server.
+         * Store the shm id to use the associated buffer later, in
+         * output commit handler.
+         */
+        pending_shm_id = buffer_id;
+        /* Set pending_outputs to the number of wayfire outputs. */
         pending_outputs = wf::get_core().output_layout->get_outputs().size();
+        /* Clear the batched damage region and schedule a redraw so
+         * the output commit handler will be called.
+         */
         for (auto& o : wf::get_core().output_layout->get_outputs())
         {
-            auto cdata = o->get_data_safe<cdata_ogon_output_commit_hook>();
+            auto cdata = o->get_data_safe<ogon_output_cdata>();
             cdata->damage.clear();
             o->render->schedule_redraw();
         }
@@ -470,22 +557,18 @@ class rdp_plugin : public wf::plugin_interface_t
         return 1;
     }
 
-    int rdsSbp(ogon_msg_sbp_reply *msg)
+    int rdsFramebufferSyncRequest(INT32 buffer_id)
     {
-        return 1;
+        return handle_framebuffer_sync_request(buffer_id);
     }
 
     int rdsImmediateSyncRequest(INT32 buffer_id)
     {
-        pending_shm_id  = buffer_id;
-        pending_outputs = wf::get_core().output_layout->get_outputs().size();
-        for (auto& o : wf::get_core().output_layout->get_outputs())
-        {
-            auto cdata = o->get_data_safe<cdata_ogon_output_commit_hook>();
-            cdata->damage.clear();
-            o->render->schedule_redraw();
-        }
+        return handle_framebuffer_sync_request(buffer_id);
+    }
 
+    int rdsSbp(ogon_msg_sbp_reply *msg)
+    {
         return 1;
     }
 
