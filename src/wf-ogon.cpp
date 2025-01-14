@@ -400,7 +400,7 @@ class rdp_plugin : public wf::plugin_interface_t
 
     int rdsScancodeKeyboardEvent(DWORD flags, DWORD code, DWORD keyboardType, UINT32 clientId)
     {
-        do_key(code,
+        do_key(ogon_rdp_scancode_to_evdev_code(flags, code, keyboardType),
             (flags & KBD_FLAGS_DOWN) ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
         return 1;
     }
