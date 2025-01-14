@@ -211,7 +211,7 @@ class rdp_plugin : public wf::plugin_interface_t
                 rdpRect = ogon_dmgbuf_get_rects(this->dmg_buf, NULL);
             }
 
-            if (ogon_buffer)
+            if (ogon_buffer && pending_outputs)
             {
                 wf::region_t combined_damage;
                 auto og = output->get_layout_geometry();
@@ -271,41 +271,35 @@ class rdp_plugin : public wf::plugin_interface_t
 
                         OpenGL::render_end();
                     }
+
+                    screen_n_rects += n_rects;
                 }
 
-                cdata->last_damage = cdata->damage;
-
-                screen_n_rects += n_rects;
-
-                if (pending_outputs)
-                {
-                    pending_outputs--;
-
-                    if (!pending_outputs)
-                    {
-                        ogon_dmgbuf_set_num_rects(this->dmg_buf, screen_n_rects);
-
-                        ogon_msg_framebuffer_sync_reply rds_sync_reply =
-                        {
-                            .bufferId = this->pending_shm_id,
-                        };
-                        ogon_service_write_message(ogon_service, OGON_SERVER_FRAMEBUFFER_SYNC_REPLY,
-                            (ogon_message*)&rds_sync_reply);
-
-                        for (auto& o : wf::get_core().output_layout->get_outputs())
-                        {
-                            auto custom_data = o->get_data_safe<cdata_ogon_output_commit_hook>();
-                            custom_data->damage.clear();
-                        }
-                    }
-                }
+                pending_outputs--;
 
                 if (!pending_outputs)
                 {
+                    ogon_dmgbuf_set_num_rects(this->dmg_buf, screen_n_rects);
+
+                    ogon_msg_framebuffer_sync_reply rds_sync_reply =
+                    {
+                        .bufferId = this->pending_shm_id,
+                    };
+                    ogon_service_write_message(ogon_service, OGON_SERVER_FRAMEBUFFER_SYNC_REPLY,
+                        (ogon_message*)&rds_sync_reply);
+
+                    for (auto& o : wf::get_core().output_layout->get_outputs())
+                    {
+                        auto custom_data = o->get_data_safe<cdata_ogon_output_commit_hook>();
+                        custom_data->damage.clear();
+                    }
+
                     screen_n_rects = 0;
                     rdpRect = NULL;
                 }
             }
+
+            cdata->last_damage = cdata->damage;
         });
 
         cdata->output_changed.set_callback([=] (wf::output_configuration_changed_signal *ev)
