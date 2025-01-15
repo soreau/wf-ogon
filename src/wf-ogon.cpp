@@ -76,8 +76,8 @@ static const struct wlr_keyboard_impl keyboard_impl = {
 class ogon_output_cdata : public wf::custom_data_t
 {
   public:
-    /* For handling output layout and mode changes */
-    wf::signal::connection_t<wf::output_configuration_changed_signal> output_changed;
+    /* For handling output mode changes */
+    wf::signal::connection_t<wf::output_configuration_changed_signal> output_config_changed;
     /* For handling output commits */
     wf::wl_listener_wrapper output_commit;
     /* For handling batched output buffer damage regions */
@@ -101,6 +101,9 @@ class rdp_plugin : public wf::plugin_interface_t
     int pending_outputs = 0;
     int pending_shm_id  = -1;
     ogon_msg_framebuffer_info rds_fb_infos;
+    wf::signal::connection_t<wf::output_layout_configuration_changed_signal> output_layout_changed;
+    wf::signal::connection_t<wf::output_added_signal> output_added;
+    wf::signal::connection_t<wf::output_removed_signal> output_removed;
 
   public:
     void *ogon_buffer = NULL;
@@ -150,12 +153,40 @@ class rdp_plugin : public wf::plugin_interface_t
             add_hook(o);
         }
 
+        LOGI("screens size: ", rds_fb_infos.width, "x", rds_fb_infos.height);
+
         rds_fb_infos.bitsPerPixel  = 32;
         rds_fb_infos.bytesPerPixel = 4;
         rds_fb_infos.userId   = (UINT32)getuid();
         rds_fb_infos.scanline = rds_fb_infos.width * 4;
         rds_fb_infos.multiseatCapable = 0;
-        LOGI("screens size: ", rds_fb_infos.width, "x", rds_fb_infos.height);
+
+        output_added.set_callback([=] (wf::output_added_signal *ev)
+        {
+            add_hook(ev->output);
+            ogon_update_screen_size();
+        });
+
+        output_removed.set_callback([=] (wf::output_removed_signal *ev)
+        {
+            rem_hook(ev->output);
+            ogon_update_screen_size();
+        });
+
+        output_layout_changed.set_callback([=] (wf::output_layout_configuration_changed_signal *ev)
+        {
+            for (auto& o : wf::get_core().output_layout->get_outputs())
+            {
+                rem_hook(o);
+                add_hook(o);
+            }
+
+            ogon_update_screen_size();
+        });
+
+        wf::get_core().output_layout->connect(&output_layout_changed);
+        wf::get_core().output_layout->connect(&output_added);
+        wf::get_core().output_layout->connect(&output_removed);
 
         /* Input */
         backend = wlr_headless_backend_create(wf::get_core().ev_loop);
@@ -168,6 +199,21 @@ class rdp_plugin : public wf::plugin_interface_t
         {
             wlr_backend_start(backend);
         }
+    }
+
+    void ogon_update_screen_size()
+    {
+        rds_fb_infos.width = rds_fb_infos.height = 0;
+        for (auto& o : wf::get_core().output_layout->get_outputs())
+        {
+            auto og = o->get_layout_geometry();
+            LOGI("output: ", og.x, ",", og.y, " ", og.width, "x", og.height);
+            rds_fb_infos.width  = std::max(og.x + og.width, int(rds_fb_infos.width));
+            rds_fb_infos.height = std::max(og.y + og.height, int(rds_fb_infos.height));
+        }
+
+        LOGI("screens size: ", rds_fb_infos.width, "x", rds_fb_infos.height);
+        ogon_send_shared_framebuffer(this);
     }
 
     /* Add commit event and output_changed handlers and damage each output */
@@ -379,22 +425,13 @@ class rdp_plugin : public wf::plugin_interface_t
             }
         });
 
-        cdata->output_changed.set_callback([=] (wf::output_configuration_changed_signal *ev)
+        cdata->output_config_changed.set_callback([=] (wf::output_configuration_changed_signal *ev)
         {
-            rds_fb_infos.width = rds_fb_infos.height = 0;
-            for (auto& o : wf::get_core().output_layout->get_outputs())
-            {
-                auto og = o->get_layout_geometry();
-                LOGI("output: ", og.x, ",", og.y, " ", og.width, "x", og.height);
-                rds_fb_infos.width  = std::max(og.x + og.width, int(rds_fb_infos.width));
-                rds_fb_infos.height = std::max(og.y + og.height, int(rds_fb_infos.height));
-            }
-
-            ogon_send_shared_framebuffer(this);
+            ogon_update_screen_size();
         });
 
         cdata->output_commit.connect(&output->handle->events.commit);
-        output->connect(&cdata->output_changed);
+        output->connect(&cdata->output_config_changed);
         output->render->damage_whole();
     }
 
@@ -402,7 +439,7 @@ class rdp_plugin : public wf::plugin_interface_t
     {
         auto cdata = output->get_data_safe<ogon_output_cdata>();
         cdata->output_commit.disconnect();
-        cdata->output_changed.disconnect();
+        cdata->output_config_changed.disconnect();
     }
 
     void do_key(uint32_t key, wl_keyboard_key_state state)
@@ -880,6 +917,10 @@ out:
         {
             rem_hook(o);
         }
+
+        output_added.disconnect();
+        output_removed.disconnect();
+        output_layout_changed.disconnect();
 
         wl_event_source_remove(server_event_source);
         ogon_service_free(ogon_service);
