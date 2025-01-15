@@ -552,6 +552,10 @@ class rdp_plugin : public wf::plugin_interface_t
          * from the outputs and copy them to the ogon screen buffer.
          */
         pending_outputs = wf::get_core().output_layout->get_outputs().size();
+        for (auto& o : wf::get_core().output_layout->get_outputs())
+        {
+            o->render->schedule_redraw();
+        }
 
         return 1;
     }
