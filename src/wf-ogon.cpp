@@ -202,50 +202,10 @@ class rdp_plugin : public wf::plugin_interface_t
                 cdata->damage |= wf::region_t{(pixman_region32_t*)&ev->state->damage};
             }
 
-            /* If we already have the ogon damage buffer, ensure it matches
-             * the shm id sent in the ogon frame sync request. If it's not,
-             * drop the buffer to be reacquired.
+            /* If ogon has issued a frame sync request, begin processing
+             * the output's damaged regions.
              */
-            if (this->dmg_buf)
-            {
-                if (ogon_dmgbuf_get_id(this->dmg_buf) != this->pending_shm_id)
-                {
-                    ogon_dmgbuf_free(this->dmg_buf);
-                    this->dmg_buf = 0;
-                }
-            }
-
-            /* If we do not have an ogon damage buffer at this point, try
-             * to acquire it using the shm id sent from the ogon frame sync
-             * request. Finally, get the pointer to the ogon buffer pixels
-             * from the damage buffer.
-             */
-            if (!this->dmg_buf)
-            {
-                this->dmg_buf = ogon_dmgbuf_connect(this->pending_shm_id);
-                if (!this->dmg_buf)
-                {
-                    LOGI(__FUNCTION__, ": unable to bind shmId=", this->pending_shm_id);
-                    return;
-                }
-
-                ogon_buffer = ogon_dmgbuf_get_data(this->dmg_buf);
-            }
-
-            /* Get the rects pointer, so we can define each rect we're
-             * copying into the buffer. This is only reset after all
-             * outputs have been committed.
-             */
-            if (!rdpRect)
-            {
-                rdpRect = ogon_dmgbuf_get_rects(this->dmg_buf, NULL);
-            }
-
-            /* If we have acquired the ogon buffer and ogon has issued a
-             * frame sync request, begin processing the output's damaged
-             * regions.
-             */
-            if (ogon_buffer && pending_outputs)
+            if (pending_outputs)
             {
                 /* We don't want to overwrite cdata->damage, so store the damage
                  * in a temporary region object. */
@@ -265,8 +225,54 @@ class rdp_plugin : public wf::plugin_interface_t
                 combined_damage = (cdata->damage | cdata->last_damage) & wf::region_t{output->get_relative_geometry()};
                 /* Get the number of rects in the combined damage region */
                 pixman_region32_rectangles(combined_damage.to_pixman(), &n_rects);
+                /* If there is damage, copy the pixels of the damaged region. */
                 if (n_rects)
                 {
+                    /* If we already have the ogon damage buffer, ensure it matches
+                     * the shm id sent in the ogon frame sync request. If it's not,
+                     * drop the buffer to be reacquired.
+                     */
+                    if (this->dmg_buf)
+                    {
+                        if (ogon_dmgbuf_get_id(this->dmg_buf) != this->pending_shm_id)
+                        {
+                            ogon_dmgbuf_free(this->dmg_buf);
+                            this->dmg_buf = 0;
+                        }
+                    }
+
+                    /* If we do not have an ogon damage buffer at this point, try
+                     * to acquire it using the shm id sent from the ogon frame sync
+                     * request. Finally, get the pointer to the ogon buffer pixels
+                     * from the damage buffer.
+                     */
+                    if (!this->dmg_buf)
+                    {
+                        this->dmg_buf = ogon_dmgbuf_connect(this->pending_shm_id);
+                        if (!this->dmg_buf)
+                        {
+                            LOGI(__FUNCTION__, ": unable to bind shmId=", this->pending_shm_id);
+                            return;
+                        }
+
+                        ogon_buffer = ogon_dmgbuf_get_data(this->dmg_buf);
+                    }
+
+                    /* If the ogon output buffer is NULL, bail. */
+                    if (!ogon_buffer)
+                    {
+                        goto out;
+                    }
+
+                    /* Get the rects pointer, so we can define each rect we're
+                     * copying into the buffer. This is only reset after all
+                     * outputs have been committed.
+                     */
+                    if (!rdpRect)
+                    {
+                        rdpRect = ogon_dmgbuf_get_rects(this->dmg_buf, NULL);
+                    }
+
                     /* If there are too many rects, just use the extents of the region. */
                     if (n_rects > (int)ogon_dmgbuf_get_max_rects(this->dmg_buf))
                     {
@@ -377,6 +383,7 @@ class rdp_plugin : public wf::plugin_interface_t
                 }
             }
 
+            out:
             /* Finally, store the current batched damage unconditonally. */
             cdata->last_damage = cdata->damage;
         });
@@ -542,17 +549,18 @@ class rdp_plugin : public wf::plugin_interface_t
          * output commit handler.
          */
         pending_shm_id = buffer_id;
-        /* Set pending_outputs to the number of wayfire outputs. */
-        pending_outputs = wf::get_core().output_layout->get_outputs().size();
-        /* Clear the batched damage region and schedule a redraw so
-         * the output commit handler will be called.
-         */
-        for (auto& o : wf::get_core().output_layout->get_outputs())
+
+        /* If there is a pending sync request, return early. */
+        if (pending_outputs)
         {
-            auto cdata = o->get_data_safe<ogon_output_cdata>();
-            cdata->damage.clear();
-            o->render->schedule_redraw();
+            return 1;
         }
+
+        /* Set pending_outputs to the number of wayfire outputs.
+         * This will cause output commit events to read the pixels
+         * from the outputs and copy them to the ogon screen buffer.
+         */
+        pending_outputs = wf::get_core().output_layout->get_outputs().size();
 
         return 1;
     }
