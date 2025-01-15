@@ -80,8 +80,8 @@ class ogon_output_cdata : public wf::custom_data_t
     wf::signal::connection_t<wf::output_configuration_changed_signal> output_changed;
     /* For handling output commits */
     wf::wl_listener_wrapper output_commit;
-    /* For handling batched regions and last output buffer damage regions */
-    wf::region_t damage, last_damage;
+    /* For handling batched output buffer damage regions */
+    wf::region_t damage;
 };
 
 class rdp_plugin : public wf::plugin_interface_t
@@ -191,11 +191,7 @@ class rdp_plugin : public wf::plugin_interface_t
             /* If the compositor submitted damage, batch it by unioning
              * it with the rest of the unprocessed damage. We must wait
              * for ogon to submit a sync request and then copy the batched
-             * damage and the last damage to the ogon output buffer. The
-             * reason for the need to copy last damage region additionally,
-             * is that the ogon output buffer contains old data from the
-             * last frame, and these regions must be updated as well to
-             * avoid artifacts.
+             * damage to the ogon output buffer.
              */
             if (ev->state->committed & WLR_OUTPUT_STATE_DAMAGE)
             {
@@ -209,7 +205,7 @@ class rdp_plugin : public wf::plugin_interface_t
             {
                 /* We don't want to overwrite cdata->damage, so store the damage
                  * in a temporary region object. */
-                wf::region_t combined_damage;
+                wf::region_t output_damage;
                 /* The layout geometry is the same as relative geometry with the
                  * exception that the x,y position are both set to 0  with
                  * relative, while the position is that of the output layout
@@ -218,13 +214,12 @@ class rdp_plugin : public wf::plugin_interface_t
                 auto og = output->get_layout_geometry();
                 /* The combined damage is set to the region of current damage,
                  * which has been batched since the last ogon frame sync request
-                 * and the last damage region, so that the pixels needed in the
-                 * ogon buffer get transfered. This is intersected with the output
-                 * geometry so we don't have any out-of-bounds rects.
+                 * intersected with the output geometry so we don't have any
+                 * rects outside the bounds of the output.
                  */
-                combined_damage = (cdata->damage | cdata->last_damage) & wf::region_t{output->get_relative_geometry()};
-                /* Get the number of rects in the combined damage region */
-                pixman_region32_rectangles(combined_damage.to_pixman(), &n_rects);
+                output_damage = cdata->damage & wf::region_t{output->get_relative_geometry()};
+                /* Get the number of rects in the output damage region */
+                pixman_region32_rectangles(output_damage.to_pixman(), &n_rects);
                 /* If there is damage, copy the pixels of the damaged region. */
                 if (n_rects)
                 {
@@ -261,7 +256,7 @@ class rdp_plugin : public wf::plugin_interface_t
                     /* If the ogon output buffer is NULL, bail. */
                     if (!ogon_buffer)
                     {
-                        goto out;
+                        return;
                     }
 
                     /* Get the rects pointer, so we can define each rect we're
@@ -282,7 +277,7 @@ class rdp_plugin : public wf::plugin_interface_t
                          */
                         n_rects = 1;
                         /* Get the extents */
-                        auto extents = combined_damage.get_extents();
+                        auto extents = output_damage.get_extents();
                         /* Make a box from the extent values */
                         wlr_box b = wlr_box{extents.x1, extents.y1, extents.x2 - extents.x1, extents.y2 - extents.y1};
                         /* Read the pixels from the relevant area and copy them into the
@@ -317,7 +312,7 @@ class rdp_plugin : public wf::plugin_interface_t
                         OpenGL::render_begin();
                         GL_CALL(glBindFramebuffer(GL_READ_FRAMEBUFFER,
                             wlr_gles2_renderer_get_buffer_fbo(wf::get_core().renderer, ev->state->buffer)));
-                        for (auto& box : combined_damage)
+                        for (auto& box : output_damage)
                         {
                             auto b     = wlr_box_from_pixman_box(box);
                             rdpRect->x = og.x + b.x;
@@ -382,10 +377,6 @@ class rdp_plugin : public wf::plugin_interface_t
                     rdpRect = NULL;
                 }
             }
-
-            out:
-            /* Finally, store the current batched damage unconditonally. */
-            cdata->last_damage = cdata->damage;
         });
 
         cdata->output_changed.set_callback([=] (wf::output_configuration_changed_signal *ev)
